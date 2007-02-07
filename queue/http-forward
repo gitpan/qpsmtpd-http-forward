@@ -1,0 +1,119 @@
+=head1 NAME
+
+http-forward Version 1.0 by Marc Sebastian Pelzer
+
+=head1 DESCRIPTION
+
+This plugin forwards the mail via HTTP to a specified server. The email header will be send
+as HTTP POST parameter 'mailheader' and the email body will be send as HTTP POST parameter 'mailbody'
+(both are URL-encoded).
+
+This plugin needs to be before all other queue plugins in the file config/plugins - otherwise it
+will not be processed! So it should look like:
+
+queue/http-forward http://test.org/bla.pl
+queue/smtp-forward localhost 2525
+
+if you want HTTP delivery of your email before sending it via SMTP to a local mailer.
+
+=head1 CONFIG
+
+It takes one required parameter, the IP address or hostname to forward to. 
+
+  queue/http-forward http://www.test.org/cgi-bin/queuemail.cgi
+
+  queue/http-forward http://www.test.org/cgi-bin/queuemail.cgi?myparams=1&b=2&c=3
+
+  queue/http-forward https://username:password@www.test.org/cgi-bin/queuemail.cgi?itsme=true
+
+Optionally you can also add a port:
+
+  queue/http-forward http://www.test.org/cgi-bin/queuemail.cgi 8080
+
+If you have installed the appropriate SSL libraries, you can also do calls to a 
+HTTPS url. Also, basic HTTP AUTH is supported (see example HTTP URL above). You can
+also add your own POST parameters to the url which will be looped through. Make sure
+that you URL-encode your values!
+
+=cut
+
+use LWP::UserAgent;
+
+sub register {
+  my ($self, $qp, @args) = @_;
+
+  if (@args > 0) {
+    if ($args[0] =~ m!^(https?://.+)$!) {
+      $self->{_http_server} = $1;
+    }
+    else {
+      die "Bad data in http server: $args[0]";
+    }
+    $self->{_http_port} = 80;
+    if (@args > 1 and $args[1] =~ /^(\d+)$/) {
+      $self->{_http_port} = $1;
+    }
+    $self->log(LOGWARN, "WARNING: Ignoring additional arguments.") if (@args > 2);
+  } else {
+    die("No HTTP server specified in http-forward config");
+  }
+}
+
+sub hook_queue {
+  my ($self, $transaction) = @_;
+  my $params;
+  my $path;
+
+  my $server = $self->{_http_server};
+  my $port = $self->{_http_port};
+
+  ($server, $path, $params) = ($server =~ m!^(http://[^\?\/]+)(/?[^\?]*)\??(.*)!);
+
+  $self->log(LOGNOTICE, "forwarding to $server:${port}${path} with paramaters '$params'");
+
+  my $ua = new LWP::UserAgent;
+
+  $ua->agent("qpsmtpd");
+  $ua->timeout(30);
+
+  my $req = HTTP::Request->new('POST', $server . ":" . $port . $path);
+
+  $req->content_type('application/x-www-form-urlencoded');
+
+  my $body;
+  my $header;
+  my $content;
+
+  #$transaction->body_resetpos;
+  #while (my $line = $transaction->body_getline) { $body .= $line; }  
+
+  $header = $transaction->header->as_string;
+  $body   = $transaction->body_as_string;
+
+  # URL-encode header and body
+  #
+  $header =~ s/([^a-zA-Z0-9])/'%'.unpack("H*", $1)/eg;
+  $header =~ s/ /\+/g;
+  $body =~ s/([^a-zA-Z0-9])/'%'.unpack("H*", $1)/eg;
+  $body =~ s/ /\+/g;
+
+  $content = "mailheader=" . $header;
+  $content .= "&mailbody=" . $body;
+
+  if ($params) { $content .= "&" . $params; }
+
+  $req->content($content);
+
+  my $res = $ua->request($req);
+  
+  unless ($res->is_success) {
+  
+    return(DECLINED, "Unable to queue message.");
+  }
+
+  $self->log(LOGNOTICE, "finished queueing");
+
+  return (DONE, "Queued!");
+}
+
+1;
